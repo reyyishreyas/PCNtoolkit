@@ -95,6 +95,7 @@ class NormativeModel:
         self.outscaler: str = outscaler
         self.y_transform: Optional[str] = y_transform
         self.name: Optional[str] = name
+        self.model_id: str = uuid.uuid4().hex
         self.response_vars: list[str] = None  # type: ignore
         self.template_regression_model: RegressionModel = template_regression_model
         self.regression_models: dict[str, RegressionModel] = {}
@@ -535,7 +536,12 @@ class NormativeModel:
                 f.write(to_json_with_one_line_lists(reg_model_dict))
 
     @classmethod
-    def load(cls, path: str, into: NormativeModel | None = None) -> NormativeModel:
+    def load(
+        cls,
+        path: str,
+        into: NormativeModel | None = None,
+        response_vars: list[str] | None = None,
+    ) -> NormativeModel:
         """
         Load a normative model from a path.
 
@@ -548,6 +554,17 @@ class NormativeModel:
         into : NormBase, optional
             The normative model to load the data into. If None, a new normative model is created.
             This is useful if you want to load a normative model into an existing normative model, for example in the runner.
+        response_vars : list[str], optional
+            Only load these response variables, and skip the other folders on
+            disk. Use this when a job predicts a subset of the variables, so
+            that it does not hold the whole model in memory. If None, all
+            response variables are loaded.
+
+        Raises
+        ------
+        ValueError
+            If a requested response variable is not on disk, or if the name in
+            a requested folder does not match the folder name.
         """
         assert isinstance(path, str), f"Path must be a string, got {type(path)}"
         assert os.path.exists(path), f"Path {path} does not exist"
@@ -571,23 +588,49 @@ class NormativeModel:
         y_transform = metadata.get("y_transform", None)
         name = metadata["name"]
 
-        response_vars = []
+        # An older model may not have a model_id; make one so that jobs can
+        # still compare against the folder they were pointed at.
+        model_id: str = metadata.get("model_id", uuid.uuid4().hex)
+
+        model_root = os.path.join(path, "model")
+        requested = None if response_vars is None else sorted(set(response_vars))
+
+        loaded_vars: list[str] = []
         outscalers = {}
         regression_models = {}
-        reg_models_path = os.path.join(path, "model", "*")
-        for path in glob.glob(reg_models_path):
-            if os.path.isdir(path):
+        var_dirs = sorted(glob.glob(os.path.join(model_root, "*")))
+        if requested is not None:
+            # Locate by folder name, so that a variable which is not on disk is
+            # an error naming it, instead of being silently skipped.
+            by_folder = {os.path.basename(d): d for d in var_dirs if os.path.isdir(d)}
+            missing = [v for v in requested if v not in by_folder]
+            if missing:
+                raise ValueError(
+                    f"Response variables {missing} are not in the model at "
+                    f"{model_root}. Available: {sorted(by_folder)}."
+                )
+            var_dirs = [by_folder[v] for v in requested]
+
+        for var_dir in var_dirs:
+            if os.path.isdir(var_dir):
                 with open(
-                    os.path.join(path, "regression_model.json"),
+                    os.path.join(var_dir, "regression_model.json"),
                     mode="r",
                     encoding="utf-8",
                 ) as f:
                     reg_model_dict = json.load(f)
                     responsevar = reg_model_dict["model"]["name"]
-                    response_vars.append(responsevar)
+                    if requested is not None and responsevar != os.path.basename(
+                        var_dir
+                    ):
+                        raise ValueError(
+                            f"Model folder {os.path.basename(var_dir)} in {var_dir} "
+                            f"holds a model named {responsevar}."
+                        )
+                    loaded_vars.append(responsevar)
                     regression_model_type = globals()[reg_model_dict["model"]["type"]]
                     regression_models[responsevar] = regression_model_type.from_dict(
-                        reg_model_dict["model"], path
+                        reg_model_dict["model"], var_dir
                     )
                     # Use the version stored in the regression model dict so
                     # that the outscaler migration uses the correct version.
@@ -598,6 +641,7 @@ class NormativeModel:
                         reg_model_dict["outscaler"],
                         version=reg_version,
                     )
+        response_vars = loaded_vars
         template_regression_model = type(regression_models[response_vars[0]]).from_dict(
             metadata["template_regression_model"], None
         )
@@ -620,8 +664,11 @@ class NormativeModel:
         self.regression_models = regression_models
         self.outscalers = outscalers
         self.response_vars = response_vars
+        self.model_id = model_id
         # Pass the top-level normative_model.json version to inscaler
         # migration so that Scaler.from_dict() can apply upgrades.
+        # Inscalers are keyed by covariate, not by response variable, so a
+        # partial model still needs all of them.
         self.inscalers = {
             k: Scaler.from_dict(v, version=norm_version)
             for k, v in metadata["inscalers"].items()
@@ -1179,8 +1226,12 @@ class NormativeModel:
         return X
 
     def to_dict(self):
+        # A fresh identity per save, so a job can tell that the folder it was
+        # pointed at now holds a different model (#564).
+        self.model_id = uuid.uuid4().hex
         my_dict = {
             "name": self.name,
+            "model_id": self.model_id,
             "save_dir": self.save_dir,
             "savemodel": self.savemodel,
             "saveresults": self.saveresults,

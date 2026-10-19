@@ -1,4 +1,6 @@
 
+import json
+
 import numpy as np
 import pytest
 
@@ -128,6 +130,66 @@ class TestNormativeModel:
         loaded_model.predict(data)
         assert (moved_dir / "results").exists()
         assert not self.save_dir.exists()
+
+    def _fit_and_save(self) -> NormData:
+        """Fit and save the model, and return the data it was fitted on."""
+        data = NormData.from_ndarrays(
+            name="test_data",
+            X=self.data["covariates"],
+            Y=self.data["responses"],
+            batch_effects=self.data["batch_effects"],
+            subject_ids=self.data["subject_ids"],
+        )
+        self.model.fit(data)
+        self.model.save()
+        return data
+
+    def test_model_load_partial(self):
+        """A partial load holds only the requested response variables."""
+        data = self._fit_and_save()
+
+        loaded = NormativeModel.load(
+            str(self.save_dir), response_vars=["response_var_0"]
+        )
+        assert loaded.response_vars == ["response_var_0"]
+        assert list(loaded.regression_models) == ["response_var_0"]
+        # Inscalers belong to the covariates, so a partial model keeps them all.
+        assert list(loaded.inscalers) == list(self.model.inscalers)
+
+        # A partial model predicts the same values as the full model, when it
+        # is given the matching slice of the data, as the runner's chunks are.
+        full_preds = self.model.predict(data)
+        partial_preds = loaded.predict(data.isel(response_vars=[0]))
+        assert partial_preds.Z.shape == (self.data["responses"].shape[0], 1)
+        np.testing.assert_allclose(partial_preds.Z.values, full_preds.Z.values[:, [0]])
+
+    def test_model_load_partial_missing_variable(self):
+        """A requested variable that is not on disk is named in the error."""
+        self._fit_and_save()
+        with pytest.raises(ValueError, match="not_in_the_model"):
+            NormativeModel.load(str(self.save_dir), response_vars=["not_in_the_model"])
+
+    def test_model_load_partial_renamed_folder(self):
+        """A folder whose contents are named differently is an error."""
+        self._fit_and_save()
+        model_dir = self.save_dir / "model"
+        (model_dir / "response_var_0").rename(model_dir / "renamed")
+        with pytest.raises(ValueError, match="response_var_0"):
+            NormativeModel.load(str(self.save_dir), response_vars=["renamed"])
+
+    def test_model_id_refreshed_by_save(self):
+        """Every save writes a new model_id, and load keeps the one on disk."""
+        self._fit_and_save()
+        with open(
+            self.save_dir / "model" / "normative_model.json", encoding="utf-8"
+        ) as f:
+            on_disk = json.load(f)
+        assert on_disk["model_id"] == self.model.model_id
+
+        first_id = self.model.model_id
+        self.model.save()
+        assert self.model.model_id != first_id
+        assert NormativeModel.load(str(self.save_dir)).model_id == self.model.model_id
 
     def test_model_with_batch_effects(self):
         """Test model with batch effect correction."""

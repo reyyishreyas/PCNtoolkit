@@ -82,6 +82,99 @@ def test_runner_predict(
     cleanup(fitted_norm_test_model, runner)
 
 
+def test_runner_predict_other_save_dir(
+    fitted_norm_test_model: NormativeModel, norm_data_from_arrays: NormData
+):
+    """Results go to save_dir, and the model is still loaded afterwards.
+
+    The runner used to load the model from the results folder after predict,
+    which raised FileNotFoundError when save_dir was not the model folder (#564).
+    """
+    runner = Runner(cross_validate=False, parallelize=False)
+    other_dir = os.path.abspath(
+        os.path.join(fitted_norm_test_model.save_dir, "..", "predict_results")
+    )
+    runner.predict(
+        fitted_norm_test_model, norm_data_from_arrays, save_dir=other_dir, observe=True
+    )
+    assert os.path.exists(os.path.join(other_dir, "results"))
+    # The model stays in its own folder, not in the results folder.
+    assert os.path.exists(
+        os.path.join(fitted_norm_test_model.save_dir, "model", "normative_model.json")
+    )
+    shutil.rmtree(other_dir)
+    cleanup(fitted_norm_test_model, runner)
+
+
+def test_runner_predict_variable_not_in_model(
+    fitted_norm_test_model: NormativeModel, norm_data_from_arrays: NormData
+):
+    """A response variable without a model folder fails at submit time (#564).
+
+    Predict used to skip such a variable without an error, so the job ran and
+    wrote fewer results than the data asked for.
+    """
+    runner = Runner(cross_validate=False, parallelize=False)
+    n_obs = norm_data_from_arrays.Y.shape[0]
+    response_vars = [str(v) for v in norm_data_from_arrays.response_vars.values]
+    df = pd.DataFrame(
+        np.hstack([norm_data_from_arrays.Y.values, np.zeros((n_obs, 1))]),
+        columns=response_vars + ["not_in_the_model"],
+    )
+    df["age"] = norm_data_from_arrays.X.values[:, 0]
+    df["site"] = norm_data_from_arrays.batch_effects.values[:, 0]
+    data_with_extra = NormData.from_dataframe(
+        "with_extra",
+        df,
+        covariates=["age"],
+        batch_effects=["site"],
+        response_vars=response_vars + ["not_in_the_model"],
+    )
+    with pytest.raises(ValueError, match="not_in_the_model"):
+        runner.predict(fitted_norm_test_model, data_with_extra, observe=True)
+    cleanup(fitted_norm_test_model, runner)
+
+
+def test_runner_predict_model_changed_after_submit(
+    fitted_norm_test_model: NormativeModel, norm_data_from_arrays: NormData
+):
+    """A model refitted into the same folder after submit is an error (#564).
+
+    Each save writes a new model_id, so the job can tell that the folder it was
+    pointed at no longer holds the model it was given.
+    """
+    runner = Runner(cross_validate=False, parallelize=False)
+    fn = runner.get_predict_chunk_fn(
+        fitted_norm_test_model, fitted_norm_test_model.save_dir
+    )
+    submitted_id = fitted_norm_test_model.model_id
+
+    fitted_norm_test_model.fit(norm_data_from_arrays)
+    fitted_norm_test_model.save()
+    assert fitted_norm_test_model.model_id != submitted_id
+
+    chunk = next(iter(norm_data_from_arrays.chunk(1)))
+    with pytest.raises(ValueError, match="not the model that was submitted"):
+        fn(chunk)
+    cleanup(fitted_norm_test_model, runner)
+
+
+def test_runner_predict_unsaved_model(
+    new_norm_test_model: NormativeModel, norm_data_from_arrays: NormData
+):
+    """Predict jobs load from disk, so an unsaved model is a clear error (#564)."""
+    runner = Runner(cross_validate=False, parallelize=False)
+    # Fit without saving, so the model is fitted but not on disk.
+    new_norm_test_model.savemodel = False
+    new_norm_test_model.fit(norm_data_from_arrays)
+    assert not os.path.exists(
+        os.path.join(new_norm_test_model.save_dir, "model", "normative_model.json")
+    )
+    with pytest.raises(ValueError, match="is not saved"):
+        runner.predict(new_norm_test_model, norm_data_from_arrays, observe=True)
+    cleanup(new_norm_test_model, runner)
+
+
 def test_runner_predict_kfold(
     new_norm_test_model: NormativeModel, norm_data_from_arrays: NormData
 ):

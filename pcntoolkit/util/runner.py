@@ -162,7 +162,11 @@ class Runner:
         self.failed_jobs: Dict[str, str] = {}
 
     def wait_or_finish(
-        self, observe: bool, into: NormativeModel | None = None, *data_sources
+        self,
+        observe: bool,
+        into: NormativeModel | None = None,
+        *data_sources,
+        model_path: Optional[str] = None,
     ) -> NormativeModel | None:
         if self.parallelize:
             if observe:
@@ -174,12 +178,12 @@ class Runner:
                 if data_sources:
                     for data_source in data_sources:
                         self.load_data(data_source)
-                return self.load_model(into=into)
+                return self.load_model(into=into, path=model_path)
             else:
                 self.save()
                 return None
         else:
-            return self.load_model(into=into)
+            return self.load_model(into=into, path=model_path)
 
     def set_task_id(self, task_name: str, model: NormativeModel, data: NormData):
         unique_id = ""
@@ -314,12 +318,26 @@ class Runner:
         """
         save_dir = save_dir if save_dir is not None else model.save_dir
         assert save_dir is not None
+        # The model path and the results folder are 2 different arguments. Take
+        # the model path as an absolute path, before any set_save_dir, so that
+        # a job which starts in $HOME still finds the model (#564).
+        model_path = os.path.abspath(model.save_dir)
+        if not self.cross_validate and not os.path.exists(
+            os.path.join(model_path, "model", "normative_model.json")
+        ):
+            raise ValueError(
+                f"The model at {model_path} is not saved. Predict jobs load the "
+                f"model from disk instead of receiving a pickled copy, so save "
+                f"the model before predicting."
+            )
         self.save_dir = save_dir
         self.set_task_id("predict", model, data)
         self.create_temp_and_log_dir()
-        fn = self.get_predict_chunk_fn(model, save_dir)
+        fn = self.get_predict_chunk_fn(model, save_dir, model_path, data)
         self.submit_jobs(fn, first_data_source=data, mode="unary")
-        return self.wait_or_finish(observe, None, data)
+        # Load the model from the model path, not from the results folder,
+        # which is a different folder when save_dir was given (#564).
+        return self.wait_or_finish(observe, None, data, model_path=model_path)
 
     def transfer(
         self,
@@ -557,8 +575,14 @@ class Runner:
 
             return fit_predict_chunk_fn
 
-    def get_predict_chunk_fn(self, model: NormativeModel, save_dir: str) -> Callable:
-        """Loads each fold model and predicts on the corresponding fold of data. Model n is used to predict on fold n."""
+    def get_predict_chunk_fn(
+        self,
+        model: NormativeModel,
+        save_dir: str,
+        model_path: Optional[str] = None,
+        data: Optional[NormData] = None,
+    ) -> Callable:
+        """Load the model for the variables of each chunk and predict on it."""
         if self.cross_validate:
             raise ValueError(
                 Output.error(
@@ -566,12 +590,46 @@ class Runner:
                 )
             )
         else:
+            # Load only this job's variables from the model path, instead of
+            # pickling the full model into every job (#564).
+            if model_path is None:
+                model_path = os.path.abspath(model.save_dir)
+            if data is not None:
+                self._check_response_vars_on_disk(model_path, data)
+            model_id = model.model_id
 
             def predict_chunk_fn(chunk: NormData):
-                model.set_save_dir(save_dir)
-                model.predict(chunk)
+                response_vars = [str(v) for v in chunk.response_vars.values]
+                chunk_model = NormativeModel.load(
+                    model_path, response_vars=response_vars
+                )
+                # The model on disk must be the one that was submitted, so that
+                # a refit into the same folder is caught here (#564).
+                if chunk_model.model_id != model_id:
+                    raise ValueError(
+                        f"The model at {model_path} is not the model that was "
+                        f"submitted: expected {model_id}, found "
+                        f"{chunk_model.model_id}."
+                    )
+                chunk_model.set_save_dir(save_dir)
+                chunk_model.predict(chunk)
 
             return predict_chunk_fn
+
+    def _check_response_vars_on_disk(self, model_path: str, data: NormData) -> None:
+        """Raise if a response variable of the data has no model folder on disk."""
+        model_root = os.path.join(model_path, "model")
+        missing = [
+            str(v)
+            for v in data.response_vars.values
+            if not os.path.isdir(os.path.join(model_root, str(v)))
+        ]
+        if missing:
+            raise ValueError(
+                f"Response variables {missing} are not in the model at "
+                f"{model_root}. Predict would skip them without an error, so "
+                f"the runner refuses the job."
+            )
 
     def get_transfer_chunk_fn(
         self, model: NormativeModel, save_dir: str, **kwargs
@@ -1035,8 +1093,16 @@ exit $exit_code
         return ["qsub", job_path]
 
     def load_model(
-        self, fold_index: Optional[int] = 0, into: NormativeModel | None = None
+        self,
+        fold_index: Optional[int] = 0,
+        into: NormativeModel | None = None,
+        path: Optional[str] = None,
     ) -> NormativeModel:
+        if path is not None:
+            # Load from an explicit folder, which is not always self.save_dir:
+            # predict writes results to save_dir, but the model stays where it
+            # was saved (#564).
+            return NormativeModel.load(path, into=into)
         if self.cross_validate:
             path = os.path.join(self.save_dir, "folds", f"fold_{fold_index}")
             return NormativeModel.load(path, into=into)
